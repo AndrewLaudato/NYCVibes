@@ -16,7 +16,7 @@ PLAYER_SIZE = (50, 50)
 ITEM_SIZE = (64, 64)
 PLAYER_SPEED = 4
 SPAWN_INTERVAL_MS = 3000
-DOG_TIMER_MS = 4000
+DOG_TIMER_MS = 6000
 EDIBLE_DURATION_MS = 5000
 SUN_DURATION_MS = 10000
 FONT_SIZE = 32
@@ -127,6 +127,50 @@ negative_sound = load_sound("negative.wav")
 boom_sound = load_sound("boom.wav")
 
 # === F: Game Loop ===
+# === B: Game State ===
+class GameState:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.player_rect = player_img.get_rect(center=map_rect.center)
+        self.hotspots = []
+        self.timed_events = []  # Store (timestamp, callback, event_id)
+        self.next_event_id = 0
+        self.devil = None
+        self.sun_active = False
+        self.sun_timer = 0
+        self.edible_timers = []
+        self.vibes = 10
+        self.last_devil_spawn = 0
+        self.devil_spawned_at = 0
+        self.music_muted = False
+        self.game_over = False
+        self.result_text = ""
+        self.inventory = []
+        self.devil_disabled = False
+
+    def apply_edible(self):
+        self.edible_timers.append(pygame.time.get_ticks())
+
+    def is_high(self):
+        now = pygame.time.get_ticks()
+        self.edible_timers = [t for t in self.edible_timers if now - t < EDIBLE_DURATION_MS]
+        return len(self.edible_timers) > 0
+
+    def schedule_event(self, delay_ms, callback, data=None):
+        event_id = self.next_event_id
+        self.timed_events.append((pygame.time.get_ticks() + delay_ms, callback, event_id, data))
+        self.next_event_id += 1
+        return event_id
+
+    def cancel_event(self, event_id):
+        self.timed_events = [event for event in self.timed_events if event[2] != event_id]
+
+def spawn_poop(state, rect):
+    state.hotspots.append({"name": "poop", "points": -5, "img": poop_img, "rect": rect})
+
+# === F: Game Loop ===
 def run_game():
     pygame.mixer.music.load(os.path.join("static", "bg_music.mp3"))
     pygame.mixer.music.play(-1)
@@ -134,12 +178,30 @@ def run_game():
     show_start_screen()
     state = GameState()
 
+    # Define the initial area around the player's start
+    initial_spawn_radius = 200
+
     for item in ["coffee", "dog"]:
         spot = next(s for s in hotspot_types if s["name"] == item)
-        rect = spot["img"].get_rect(topleft=(random.randint(0, map_rect.width - ITEM_SIZE[0]), random.randint(0, map_rect.height - ITEM_SIZE[1])))
+        # Generate random coordinates within the initial spawn radius
+        random_x = random.randint(state.player_rect.centerx - initial_spawn_radius,
+                                   state.player_rect.centerx + initial_spawn_radius - ITEM_SIZE[0])
+        random_y = random.randint(state.player_rect.centery - initial_spawn_radius,
+                                   state.player_rect.centery + initial_spawn_radius - ITEM_SIZE[1])
+
+        # Ensure the coordinates are within the map bounds
+        spawn_x = max(0, min(random_x, map_rect.width - ITEM_SIZE[0]))
+        spawn_y = max(0, min(random_y, map_rect.height - ITEM_SIZE[1]))
+
+        rect = spot["img"].get_rect(topleft=(spawn_x, spawn_y))
         state.hotspots.append({**spot, "rect": rect})
         if item == "dog":
-            schedule_event(state, DOG_TIMER_MS, lambda r=rect: spawn_poop(state, r))
+            # Schedule the poop spawn and store the event ID
+            dog_poop_event_id = state.schedule_event(DOG_TIMER_MS, spawn_poop, rect)
+            # Store the event ID associated with this dog in the hotspot data
+            for h in state.hotspots:
+                if h['rect'] == rect and h['name'] == 'dog':
+                    h['poop_event_id'] = dog_poop_event_id
 
     grenade_rect = grenade_img.get_rect(topleft=(random.randint(0, map_rect.width - ITEM_SIZE[0]), random.randint(0, map_rect.height - ITEM_SIZE[1])))
     state.hotspots.append({"name": "grenade", "points": 0, "img": grenade_img, "rect": grenade_rect})
@@ -159,7 +221,12 @@ def run_game():
                 rect = spot['img'].get_rect(topleft=(random.randint(0, map_rect.width - ITEM_SIZE[0]), random.randint(0, map_rect.height - ITEM_SIZE[1])))
                 if spot['name'] == "dog":
                     state.hotspots.append({**spot, "rect": rect})
-                    schedule_event(state, DOG_TIMER_MS, lambda r=rect: spawn_poop(state, r))
+                    # Schedule poop for newly spawned dogs and store the event ID
+                    dog_poop_event_id = state.schedule_event(DOG_TIMER_MS, spawn_poop, rect)
+                    # Store the event ID associated with this dog
+                    for h in state.hotspots:
+                        if h['rect'] == rect and h['name'] == 'dog':
+                            h['poop_event_id'] = dog_poop_event_id
                 else:
                     state.hotspots.append({**spot, "rect": rect})
             elif event.type == USEREVENT+2 and not state.devil_disabled and state.devil is None:
@@ -206,7 +273,14 @@ def run_game():
                 pygame.mixer.music.load(os.path.join("static", "bg_music.mp3"))
                 pygame.mixer.music.play(-1)
 
-        state.timed_events = [(t, cb) for (t, cb) in state.timed_events if now < t or not (cb() or True)]
+        # Process timed events
+        new_timed_events = []
+        for t, cb, event_id, data in state.timed_events:
+            if now < t:
+                new_timed_events.append((t, cb, event_id, data))
+            else:
+                cb(state, data)  # Execute the callback with state and data
+        state.timed_events = new_timed_events
 
         camera_x = max(0, min(state.player_rect.centerx - SCREEN_WIDTH // 2, map_rect.width - SCREEN_WIDTH))
         camera_y = max(0, min(state.player_rect.centery - SCREEN_HEIGHT // 2, map_rect.height - SCREEN_HEIGHT))
@@ -239,6 +313,10 @@ def run_game():
                         state.devil = None
                         pygame.mixer.music.load(os.path.join("static", "bg_music.mp3"))
                         pygame.mixer.music.play(-1)
+                elif h['name'] == "dog":
+                    # When a dog is collected, cancel its poop event
+                    if 'poop_event_id' in h:
+                        state.cancel_event(h['poop_event_id'])
 
                 state.hotspots.remove(h)
             else:
@@ -289,6 +367,13 @@ def show_start_screen():
     screen.blit(start_screen_img, (0, 0))
     pygame.display.flip()
     wait_for_key()
+    pygame.mixer.music.load(os.path.join("static", "bg_music.mp3"))
+    pygame.mixer.music.play(-1)
 
 # Run Game
-run_game()
+if __name__ == '__main__':
+    run_game()
+
+
+
+
